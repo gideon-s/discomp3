@@ -1,5 +1,7 @@
 # discomp3play
 
+[![CI](https://github.com/gideon-s/discomp3/actions/workflows/ci.yml/badge.svg)](https://github.com/gideon-s/discomp3/actions/workflows/ci.yml)
+
 A Discord bot that queues up local audio files and streams them into a voice
 channel in sequence. Built with [discord.py](https://discordpy.readthedocs.io/)
 and slash commands.
