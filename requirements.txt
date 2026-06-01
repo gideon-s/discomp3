@@ -1,0 +1,5 @@
+discord.py[voice]>=2.4
+python-dotenv>=1.0
+mutagen>=1.47
+# audioop was removed from the stdlib in Python 3.13; discord.py voice needs it.
+audioop-lts; python_version >= "3.13"
