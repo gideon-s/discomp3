@@ -13,6 +13,12 @@ import mutagen
 # reason to reject other common formats the same machinery handles.
 AUDIO_EXTS = {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 
+# Directory names and filename prefixes that mark macOS-zip junk. AppleDouble
+# files (`._foo.mp3`) and `__MACOSX/` mirror dirs aren't real audio and would
+# show up as broken tracks in `/list`.
+SKIP_DIR_NAMES = {"__MACOSX"}
+SKIP_FILENAME_PREFIXES = ("._",)
+
 
 @dataclass(frozen=True)
 class Track:
@@ -24,6 +30,7 @@ class Track:
     artist: str | None = None
     album: str | None = None
     track_num: int | None = None
+    disc_num: int | None = None
 
     @property
     def display(self) -> str:
@@ -35,14 +42,19 @@ class Track:
         return self.name
 
 
-def _read_tags(path: str) -> tuple[str | None, str | None, str | None, int | None]:
-    """Return (title, artist, album, track_num) from the file's tags."""
+def _norm_key(s: str) -> str:
+    """Case- and whitespace-insensitive key for grouping ('The  Beatles' == 'the beatles')."""
+    return " ".join(s.lower().split())
+
+
+def _read_tags(path: str) -> tuple[str | None, str | None, str | None, int | None, int | None]:
+    """Return (title, artist, album, track_num, disc_num) from the file's tags."""
     try:
         audio = mutagen.File(path, easy=True)
     except Exception:
-        return None, None, None, None
+        return None, None, None, None, None
     if audio is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     def first(key: str) -> str | None:
         v = audio.get(key)
@@ -55,14 +67,20 @@ def _read_tags(path: str) -> tuple[str | None, str | None, str | None, int | Non
         s = first(key)
         if s is None:
             return None
-        # tracknumber is often "3/12" — take the leading integer
+        # tracknumber/discnumber are often "3/12" — take the leading integer
         head = s.split("/", 1)[0].strip()
         try:
             return int(head)
         except ValueError:
             return None
 
-    return first("title"), first("artist"), first("album"), first_int("tracknumber")
+    return (
+        first("title"),
+        first("artist"),
+        first("album"),
+        first_int("tracknumber"),
+        first_int("discnumber"),
+    )
 
 
 class Library:
@@ -103,6 +121,10 @@ class Library:
             for p in sorted(self.root.rglob("*")):
                 if not (p.is_file() and p.suffix.lower() in AUDIO_EXTS):
                     continue
+                if p.name.startswith(SKIP_FILENAME_PREFIXES):
+                    continue
+                if any(part in SKIP_DIR_NAMES for part in p.parts):
+                    continue
                 path = str(p)
                 mtime = p.stat().st_mtime
                 cached = self._file_cache.get(path)
@@ -110,7 +132,7 @@ class Library:
                     out.append(cached[1])
                     continue
                 rel = p.relative_to(self.root).with_suffix("")
-                title, artist, album, track_num = _read_tags(path)
+                title, artist, album, track_num, disc_num = _read_tags(path)
                 track = Track(
                     name=str(rel),
                     path=path,
@@ -118,6 +140,7 @@ class Library:
                     artist=artist,
                     album=album,
                     track_num=track_num,
+                    disc_num=disc_num,
                 )
                 self._file_cache[path] = (mtime, track)
                 out.append(track)
@@ -164,44 +187,91 @@ class Library:
         matches = self.search(q)
         return matches[0] if matches else None
 
-    def albums(self, *, refresh: bool = True) -> dict[str, list[Track]]:
-        """Group tracks by album tag (missing -> 'Unknown Album'), sorted by album name."""
-        out: dict[str, list[Track]] = {}
-        source = self.tracks() if refresh else self.tracks_cached()
+    def _group_case_insensitive(
+        self,
+        *,
+        field: str,
+        unknown_label: str,
+        source: list[Track] | None = None,
+        refresh: bool = True,
+    ) -> dict[str, list[Track]]:
+        """Group tracks by a tag field, merging case/whitespace variants.
+
+        The displayed name for each group is the spelling used by the most
+        tracks (ties broken alphabetically), so `/list` shows a single
+        canonical entry rather than splitting `Devo` and `DEVO` apart.
+
+        Pass `source` to group a pre-filtered subset (e.g. one artist's tracks)
+        instead of the whole library.
+        """
+        by_norm: dict[str, dict[str, list[Track]]] = {}
+        if source is None:
+            source = self.tracks() if refresh else self.tracks_cached()
         for t in source:
-            key = t.album or "Unknown Album"
-            out.setdefault(key, []).append(t)
+            value = getattr(t, field) or unknown_label
+            by_norm.setdefault(_norm_key(value), {}).setdefault(value, []).append(t)
+
+        out: dict[str, list[Track]] = {}
+        for spellings in by_norm.values():
+            canonical = max(spellings, key=lambda s: (len(spellings[s]), s))
+            out[canonical] = [t for ts in spellings.values() for t in ts]
         return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+
+    def albums(self, *, refresh: bool = True) -> dict[str, list[Track]]:
+        """Group tracks by album, case- and whitespace-insensitive."""
+        return self._group_case_insensitive(
+            field="album", unknown_label="Unknown Album", refresh=refresh
+        )
 
     def artists(self, *, refresh: bool = True) -> dict[str, list[Track]]:
-        """Group tracks by artist tag (missing -> 'Unknown Artist'), sorted by artist name."""
-        out: dict[str, list[Track]] = {}
-        source = self.tracks() if refresh else self.tracks_cached()
-        for t in source:
-            key = t.artist or "Unknown Artist"
-            out.setdefault(key, []).append(t)
-        return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+        """Group tracks by artist, case- and whitespace-insensitive."""
+        return self._group_case_insensitive(
+            field="artist", unknown_label="Unknown Artist", refresh=refresh
+        )
 
-    def tracks_by_album(self, name: str) -> list[Track]:
-        """Return all tracks on a given album, ordered by tracknumber then path."""
-        target = name.strip().lower()
-        matches = [
-            t for t in self.tracks()
-            if (t.album or "Unknown Album").lower() == target
-        ]
-        matches.sort(key=lambda t: (t.track_num if t.track_num is not None else 9999, t.path))
+    def albums_by_artist(self, artist_name: str, *, refresh: bool = True) -> dict[str, list[Track]]:
+        """Return {album: [tracks]} for albums containing tracks by this artist."""
+        target = _norm_key(artist_name)
+        source = self.tracks() if refresh else self.tracks_cached()
+        matching = [t for t in source if _norm_key(t.artist or "Unknown Artist") == target]
+        return self._group_case_insensitive(
+            field="album", unknown_label="Unknown Album", source=matching
+        )
+
+    def tracks_by_album(self, name: str, *, artist: str | None = None) -> list[Track]:
+        """Return all tracks on an album, ordered by (disc, tracknumber, path).
+
+        When `artist` is given, only tracks whose artist tag matches are
+        returned — used to disambiguate albums that share a name across
+        different artists (e.g. "Greatest Hits").
+        """
+        target = _norm_key(name)
+        artist_target = _norm_key(artist) if artist else None
+        matches: list[Track] = []
+        for t in self.tracks():
+            if _norm_key(t.album or "Unknown Album") != target:
+                continue
+            if artist_target is not None and _norm_key(t.artist or "Unknown Artist") != artist_target:
+                continue
+            matches.append(t)
+        matches.sort(key=lambda t: (
+            t.disc_num if t.disc_num is not None else 1,
+            t.track_num if t.track_num is not None else 9999,
+            t.path,
+        ))
         return matches
 
     def tracks_by_artist(self, name: str) -> list[Track]:
-        """Return all tracks by a given artist, grouped by album then tracknumber."""
-        target = name.strip().lower()
+        """Return all tracks by a given artist, grouped by (album, disc, tracknumber)."""
+        target = _norm_key(name)
         matches = [
             t for t in self.tracks()
-            if (t.artist or "Unknown Artist").lower() == target
+            if _norm_key(t.artist or "Unknown Artist") == target
         ]
         matches.sort(
             key=lambda t: (
-                (t.album or "").lower(),
+                _norm_key(t.album or ""),
+                t.disc_num if t.disc_num is not None else 1,
                 t.track_num if t.track_num is not None else 9999,
                 t.path,
             )

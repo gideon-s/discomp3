@@ -77,8 +77,16 @@ async def track_autocomplete(interaction: discord.Interaction, current: str) -> 
 
 
 async def album_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    # If the same command also has an `artist` parameter and the user has
+    # filled it in, cascade: only show that artist's albums. Otherwise show
+    # every album in the library.
     q = current.lower().strip()
-    names = [n for n in library.albums(refresh=False) if not q or q in n.lower()][:25]
+    artist_value = getattr(interaction.namespace, "artist", None)
+    if artist_value:
+        albums = library.albums_by_artist(artist_value, refresh=False)
+    else:
+        albums = library.albums(refresh=False)
+    names = [n for n in albums if not q or q in n.lower()][:25]
     return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names]
 
 
@@ -207,17 +215,20 @@ async def _queue_many(
     )
 
 
-@bot.tree.command(name="playalbum", description="Queue every track from an album")
-@app_commands.describe(album="Album name (autocomplete)")
-@app_commands.autocomplete(album=album_autocomplete)
-async def playalbum(interaction: discord.Interaction, album: str) -> None:
+@bot.tree.command(name="playalbum", description="Queue every track from an album by a given artist")
+@app_commands.describe(
+    artist="Artist (autocomplete). Pick first to filter the album list.",
+    album="Album name (autocomplete cascades from artist).",
+)
+@app_commands.autocomplete(artist=artist_autocomplete, album=album_autocomplete)
+async def playalbum(interaction: discord.Interaction, artist: str, album: str) -> None:
     await interaction.response.defer()
-    tracks = library.tracks_by_album(album)
+    tracks = library.tracks_by_album(album, artist=artist)
     await _queue_many(
         interaction,
         tracks,
-        label=f"**{album}**",
-        empty_msg=f"❌ No album matching `{album}`.",
+        label=f"**{artist} — {album}**",
+        empty_msg=f"❌ No album matching `{album}` by `{artist}`.",
     )
 
 
@@ -456,7 +467,7 @@ async def help_cmd(interaction: discord.Interaction) -> None:
         name="▶️ Playback",
         value=(
             "`/play <query>` — Queue a track (autocomplete enabled)\n"
-            "`/playalbum <album>` — Queue every track on an album\n"
+            "`/playalbum <artist> <album>` — Queue every track on an album (album list filters to the chosen artist)\n"
             "`/playartist <artist>` — Queue every track by an artist\n"
             "`/pause` · `/resume` — Pause / resume playback\n"
             "`/skip` — Skip the current track\n"
